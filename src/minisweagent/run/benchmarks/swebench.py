@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import typer
 from jinja2 import StrictUndefined, Template
@@ -49,6 +50,7 @@ Examples:
 """
 
 DEFAULT_CONFIG_FILE = builtin_config_dir / "benchmarks" / "swebench.yaml"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[6] / "outputs" / "agent"
 
 DATASET_MAPPING = {
     "full": "princeton-nlp/SWE-Bench",
@@ -119,15 +121,52 @@ def remove_from_preds_file(output_path: Path, instance_id: str):
             output_path.write_text(json.dumps(output_data, indent=2))
 
 
+def replace_api_base_port(api_base: str, port: int) -> str:
+    """Return api_base with its host preserved and TCP port replaced."""
+    parsed = urlsplit(api_base)
+    host = parsed.hostname or "localhost"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}"
+    if parsed.username:
+        auth = parsed.username
+        if parsed.password:
+            auth += f":{parsed.password}"
+        netloc = f"{auth}@{netloc}"
+    return urlunsplit((parsed.scheme or "http", netloc, parsed.path or "/v1", parsed.query, parsed.fragment))
+
+
+def load_original_patches(preds_path: Path) -> dict[str, str]:
+    """Load instance_id -> model_patch from a SWE-bench predictions file."""
+    preds = json.loads(preds_path.read_text())
+    return {instance_id: prediction.get("model_patch", "") for instance_id, prediction in preds.items()}
+
+
+def attach_original_patches(instances: list[dict], original_patch_path: Path | None) -> list[dict]:
+    if original_patch_path is None:
+        return instances
+
+    original_patches = load_original_patches(original_patch_path)
+    missing = [instance["instance_id"] for instance in instances if instance["instance_id"] not in original_patches]
+    if missing:
+        missing_preview = ", ".join(missing[:5])
+        if len(missing) > 5:
+            missing_preview += f", ... ({len(missing)} total)"
+        raise ValueError(f"Original patch file is missing predictions for: {missing_preview}")
+
+    return [{**instance, "original_patch": original_patches[instance["instance_id"]]} for instance in instances]
+
+
 def process_instance(
     instance: dict,
     output_dir: Path,
+    traj_dir: Path,
     config: dict,
     progress_manager: RunBatchProgressManager,
 ) -> None:
     """Process a single SWEBench instance."""
     instance_id = instance["instance_id"]
-    instance_dir = output_dir / instance_id
+    instance_dir = traj_dir / instance_id
     # avoid inconsistent state if something here fails and there's leftover previous files
     remove_from_preds_file(output_dir / "preds.json", instance_id)
     (instance_dir / f"{instance_id}.traj.json").unlink(missing_ok=True)
@@ -151,7 +190,7 @@ def process_instance(
             instance_id=instance_id,
             **config.get("agent", {}),
         )
-        info = agent.run(task)
+        info = agent.run(task, original_patch=instance.get("original_patch", ""))
         exit_status = info.get("exit_status")
         result = info.get("submission")
     except Exception as e:
@@ -161,6 +200,7 @@ def process_instance(
     finally:
         if agent is not None:
             traj_path = instance_dir / f"{instance_id}.traj.json"
+            traj_path.parent.mkdir(parents=True, exist_ok=True)
             agent.save(
                 traj_path,
                 {
@@ -205,18 +245,23 @@ def main(
     slice_spec: str = typer.Option("", "--slice", help="Slice specification (e.g., '0:5' for first 5 instances)", rich_help_panel="Data selection"),
     filter_spec: str = typer.Option("", "--filter", help="Filter instance IDs by regex", rich_help_panel="Data selection"),
     shuffle: bool = typer.Option(False, "--shuffle", help="Shuffle instances", rich_help_panel="Data selection"),
-    output: str = typer.Option("", "-o", "--output", help="Output directory", rich_help_panel="Basic"),
+    output: Path = typer.Option(DEFAULT_OUTPUT_DIR, "-o", "--output", help="Output directory", rich_help_panel="Basic"),
     workers: int = typer.Option(1, "-w", "--workers", help="Number of worker threads for parallel processing", rich_help_panel="Basic"),
     model: str | None = typer.Option(None, "-m", "--model", help="Model to use", rich_help_panel="Basic"),
+    port: int | None = typer.Option(None, "--port", help="Replace model.model_kwargs.api_base port", rich_help_panel="Basic"),
+    original_patch: Path | None = typer.Option(None, "--original-patch", help="Path to a preds.json file used as original patches", rich_help_panel="Basic"),
     model_class: str | None = typer.Option(None, "--model-class", help="Model class to use (e.g., 'anthropic' or 'minisweagent.models.anthropic.AnthropicModel')", rich_help_panel="Advanced"),
     redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances", rich_help_panel="Data selection"),
     config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT, rich_help_panel="Basic"),
     environment_class: str | None = typer.Option(None, "--environment-class", help="Environment type to use. Recommended are docker or singularity", rich_help_panel="Advanced"),
 ) -> None:
     # fmt: on
-    output_path = Path(output)
+    output_path = output
+    traj_path = output_path / "traj"
     output_path.mkdir(parents=True, exist_ok=True)
+    traj_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Results will be saved to {output_path}")
+    logger.info(f"Trajectories will be saved to {traj_path}")
     add_file_handler(output_path / "minisweagent.log")
 
     from datasets import load_dataset
@@ -230,6 +275,7 @@ def main(
         existing_instances = list(json.loads((output_path / "preds.json").read_text()).keys())
         logger.info(f"Skipping {len(existing_instances)} existing instances")
         instances = [instance for instance in instances if instance["instance_id"] not in existing_instances]
+    instances = attach_original_patches(instances, original_patch)
     logger.info(f"Running on {len(instances)} instances...")
 
     logger.info(f"Building agent config from specs: {config_spec}")
@@ -239,6 +285,9 @@ def main(
         "model": {"model_name": model or UNSET, "model_class": model_class or UNSET},
     })
     config = recursive_merge(*configs)
+    if port is not None:
+        model_kwargs = config.setdefault("model", {}).setdefault("model_kwargs", {})
+        model_kwargs["api_base"] = replace_api_base_port(model_kwargs.get("api_base", "http://localhost/v1"), port)
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
 
@@ -256,7 +305,7 @@ def main(
     with Live(progress_manager.render_group, refresh_per_second=4):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(process_instance, instance, output_path, config, progress_manager): instance[
+                executor.submit(process_instance, instance, output_path, traj_path, config, progress_manager): instance[
                     "instance_id"
                 ]
                 for instance in instances
