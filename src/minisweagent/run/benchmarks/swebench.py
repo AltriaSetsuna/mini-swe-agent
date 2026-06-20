@@ -136,25 +136,40 @@ def replace_api_base_port(api_base: str, port: int) -> str:
     return urlunsplit((parsed.scheme or "http", netloc, parsed.path or "/v1", parsed.query, parsed.fragment))
 
 
-def load_original_patches(preds_path: Path) -> dict[str, str]:
-    """Load instance_id -> model_patch from a SWE-bench predictions file."""
+def load_original_patches(original_patch_dir: Path) -> tuple[dict[str, str], set[str]]:
+    """Load successful instance patches from an agent output directory."""
+    preds_path = original_patch_dir / "preds.json"
+    resolved_ids_path = original_patch_dir / "resolved_ids.json"
+    if not preds_path.exists() or not resolved_ids_path.exists():
+        raise FileNotFoundError(
+            f"--original-patch must point to a directory containing preds.json and resolved_ids.json: "
+            f"{original_patch_dir}"
+        )
     preds = json.loads(preds_path.read_text())
-    return {instance_id: prediction.get("model_patch", "") for instance_id, prediction in preds.items()}
+    resolved_ids = set(json.loads(resolved_ids_path.read_text())["resolved_ids"])
+    original_patches = {instance_id: prediction.get("model_patch", "") for instance_id, prediction in preds.items()}
+    return original_patches, resolved_ids
 
 
-def attach_original_patches(instances: list[dict], original_patch_path: Path | None) -> list[dict]:
-    if original_patch_path is None:
+def attach_original_patches(instances: list[dict], original_patch_dir: Path | None) -> list[dict]:
+    if original_patch_dir is None:
         return instances
 
-    original_patches = load_original_patches(original_patch_path)
-    missing = [instance["instance_id"] for instance in instances if instance["instance_id"] not in original_patches]
-    if missing:
-        missing_preview = ", ".join(missing[:5])
-        if len(missing) > 5:
-            missing_preview += f", ... ({len(missing)} total)"
-        raise ValueError(f"Original patch file is missing predictions for: {missing_preview}")
+    original_patches, resolved_ids = load_original_patches(original_patch_dir)
+    original_patches = {
+        instance_id: patch for instance_id, patch in original_patches.items() if instance_id in resolved_ids
+    }
 
-    return [{**instance, "original_patch": original_patches[instance["instance_id"]]} for instance in instances]
+    filtered_instances = []
+    for instance in instances:
+        instance_id = instance["instance_id"]
+        if instance_id in original_patches:
+            filtered_instances.append({**instance, "original_patch": original_patches[instance_id]})
+    logger.info(
+        f"Filtered to {len(filtered_instances)} instances with resolved original patches "
+        f"from {len(instances)} candidates"
+    )
+    return filtered_instances
 
 
 def process_instance(
@@ -249,7 +264,7 @@ def main(
     workers: int = typer.Option(1, "-w", "--workers", help="Number of worker threads for parallel processing", rich_help_panel="Basic"),
     model: str | None = typer.Option(None, "-m", "--model", help="Model to use", rich_help_panel="Basic"),
     port: int | None = typer.Option(None, "--port", help="Replace model.model_kwargs.api_base port", rich_help_panel="Basic"),
-    original_patch: Path | None = typer.Option(None, "--original-patch", help="Path to a preds.json file used as original patches", rich_help_panel="Basic"),
+    original_patch: Path | None = typer.Option(None, "--original-patch", help="Path to an output directory containing preds.json and resolved_ids.json", rich_help_panel="Basic"),
     model_class: str | None = typer.Option(None, "--model-class", help="Model class to use (e.g., 'anthropic' or 'minisweagent.models.anthropic.AnthropicModel')", rich_help_panel="Advanced"),
     redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances", rich_help_panel="Data selection"),
     config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT, rich_help_panel="Basic"),
@@ -257,7 +272,7 @@ def main(
 ) -> None:
     # fmt: on
     output_path = output
-    traj_path = output_path / "traj"
+    traj_path = output_path / "trajs"
     output_path.mkdir(parents=True, exist_ok=True)
     traj_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Results will be saved to {output_path}")
