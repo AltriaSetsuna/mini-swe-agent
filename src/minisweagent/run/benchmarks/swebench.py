@@ -61,6 +61,8 @@ DATASET_MAPPING = {
     "smith": "SWE-bench/SWE-smith",
     "_test": "klieret/swe-bench-dummy-test-dataset",
     "rebench": "nebius/SWE-rebench",
+    "pro": "ScaleAI/SWE-bench_Pro",
+    "deepswe": "datacurve/deep-swe"
 }
 
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
@@ -70,6 +72,10 @@ _OUTPUT_FILE_LOCK = threading.Lock()
 def get_swebench_docker_image_name(instance: dict) -> str:
     """Get the image name for a SWEBench instance."""
     image_name = instance.get("image_name", None) or instance.get("docker_image", None)
+    dockerhub_tag = instance.get("dockerhub_tag", None)
+    if dockerhub_tag is not None:
+        return f"docker.io/jefzda/sweap-images:{dockerhub_tag}"
+
     if image_name is None:
         # Docker doesn't allow double underscore, so we replace them with a magic token
         iid = instance["instance_id"]
