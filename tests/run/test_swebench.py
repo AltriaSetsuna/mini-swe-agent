@@ -9,7 +9,10 @@ from minisweagent import package_dir
 from minisweagent.models.test_models import DeterministicModel, make_output
 from minisweagent.run.benchmarks.swebench import (
     filter_instances,
+    filter_instances_with_local_images,
+    get_docker_image_name_candidates,
     get_swebench_docker_image_name,
+    local_docker_image_exists,
     main,
     remove_from_preds_file,
     update_preds_file,
@@ -101,6 +104,49 @@ def test_get_image_name_with_complex_instance_id():
     instance = {"instance_id": "project__sub__module__version__1.2.3"}
     expected = "docker.io/swebench/sweb.eval.x86_64.project_1776_sub_1776_module_1776_version_1776_1.2.3:latest"
     assert get_swebench_docker_image_name(instance) == expected
+
+
+def test_get_docker_image_name_candidates_with_docker_io_prefix():
+    image_name = "docker.io/swebench/sweb.eval.x86_64.test:latest"
+    assert get_docker_image_name_candidates(image_name) == [
+        "docker.io/swebench/sweb.eval.x86_64.test:latest",
+        "swebench/sweb.eval.x86_64.test:latest",
+    ]
+
+
+def test_get_docker_image_name_candidates_without_docker_io_prefix():
+    image_name = "swebench/sweb.eval.x86_64.test:latest"
+    assert get_docker_image_name_candidates(image_name) == [
+        "swebench/sweb.eval.x86_64.test:latest",
+        "docker.io/swebench/sweb.eval.x86_64.test:latest",
+    ]
+
+
+def test_local_docker_image_exists_checks_without_docker_io_prefix():
+    def fake_run(cmd, **kwargs):
+        image_name = cmd[-1]
+        return type("Result", (), {"returncode": 0 if not image_name.startswith("docker.io/") else 1})()
+
+    with patch("minisweagent.run.benchmarks.swebench.subprocess.run", side_effect=fake_run) as mock_run:
+        assert local_docker_image_exists("docker.io/swebench/sweb.eval.x86_64.test:latest")
+
+    assert [call.args[0][-1] for call in mock_run.call_args_list] == [
+        "docker.io/swebench/sweb.eval.x86_64.test:latest",
+        "swebench/sweb.eval.x86_64.test:latest",
+    ]
+
+
+def test_filter_instances_with_local_images_skips_missing_images():
+    instances = [
+        {"instance_id": "repo__kept", "image_name": "docker.io/swebench/kept:latest"},
+        {"instance_id": "repo__skipped", "image_name": "docker.io/swebench/skipped:latest"},
+    ]
+
+    with patch(
+        "minisweagent.run.benchmarks.swebench.local_docker_image_exists",
+        side_effect=lambda image_name, *, executable: image_name.endswith("kept:latest"),
+    ):
+        assert filter_instances_with_local_images(instances, docker_executable="podman") == [instances[0]]
 
 
 def test_filter_instances_no_filters():

@@ -5,8 +5,10 @@
 
 import concurrent.futures
 import json
+import os
 import random
 import re
+import subprocess
 import threading
 import time
 import traceback
@@ -62,7 +64,8 @@ DATASET_MAPPING = {
     "_test": "klieret/swe-bench-dummy-test-dataset",
     "rebench": "nebius/SWE-rebench",
     "pro": "ScaleAI/SWE-bench_Pro",
-    "deepswe": "datacurve/deep-swe"
+    "deepswe": "datacurve/deep-swe",
+    "rebenchv2":"nebius/SWE-rebench-V2"
 }
 
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
@@ -82,6 +85,62 @@ def get_swebench_docker_image_name(instance: dict) -> str:
         id_docker_compatible = iid.replace("__", "_1776_")
         image_name = f"docker.io/swebench/sweb.eval.x86_64.{id_docker_compatible}:latest".lower()
     return image_name
+
+
+def get_docker_image_name_candidates(image_name: str) -> list[str]:
+    """Return local image names to check, accounting for optional docker.io prefix."""
+    candidates = [image_name]
+    docker_io_prefix = "docker.io/"
+    if image_name.startswith(docker_io_prefix):
+        candidates.append(image_name[len(docker_io_prefix) :])
+    else:
+        candidates.append(f"{docker_io_prefix}{image_name}")
+    return list(dict.fromkeys(candidates))
+
+
+def local_docker_image_exists(image_name: str, *, executable: str = "docker") -> bool:
+    """Check whether a Docker image exists locally without pulling it."""
+    for candidate in get_docker_image_name_candidates(image_name):
+        try:
+            result = subprocess.run(
+                [executable, "image", "inspect", candidate],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def filter_instances_with_local_images(
+    instances: list[dict], *, docker_executable: str = "docker"
+) -> list[dict]:
+    """Keep only instances whose SWE-bench Docker image is available locally."""
+    image_exists_cache: dict[str, bool] = {}
+    filtered_instances = []
+    skipped_instances = []
+
+    for instance in instances:
+        image_name = get_swebench_docker_image_name(instance)
+        if image_name not in image_exists_cache:
+            image_exists_cache[image_name] = local_docker_image_exists(image_name, executable=docker_executable)
+        if image_exists_cache[image_name]:
+            filtered_instances.append(instance)
+        else:
+            skipped_instances.append((instance["instance_id"], image_name))
+
+    if skipped_instances:
+        logger.info(
+            f"Skipping {len(skipped_instances)} instances without local SWE-bench Docker images "
+            f"({len(instances)} -> {len(filtered_instances)})"
+        )
+        for instance_id, image_name in skipped_instances:
+            logger.debug(f"Skipping instance {instance_id}: local image not found for {image_name}")
+
+    return filtered_instances
 
 
 def get_sb_environment(config: dict, instance: dict) -> Environment:
@@ -297,7 +356,6 @@ def main(
         logger.info(f"Skipping {len(existing_instances)} existing instances")
         instances = [instance for instance in instances if instance["instance_id"] not in existing_instances]
     instances = attach_original_patches(instances, original_patch)
-    logger.info(f"Running on {len(instances)} instances...")
 
     logger.info(f"Building agent config from specs: {config_spec}")
     configs = [get_config_from_spec(spec) for spec in config_spec]
@@ -309,6 +367,10 @@ def main(
     if port is not None:
         model_kwargs = config.setdefault("model", {}).setdefault("model_kwargs", {})
         model_kwargs["api_base"] = replace_api_base_port(model_kwargs.get("api_base", "http://localhost/v1"), port)
+
+    docker_executable = config.get("environment", {}).get("executable", os.getenv("MSWEA_DOCKER_EXECUTABLE", "docker"))
+    instances = filter_instances_with_local_images(instances, docker_executable=docker_executable)
+    logger.info(f"Running on {len(instances)} instances...")
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
 
