@@ -12,6 +12,7 @@ from minisweagent.run.benchmarks.swebench import (
     filter_instances_with_local_images,
     get_docker_image_name_candidates,
     get_swebench_docker_image_name,
+    list_local_docker_images,
     local_docker_image_exists,
     main,
     remove_from_preds_file,
@@ -122,18 +123,25 @@ def test_get_docker_image_name_candidates_without_docker_io_prefix():
     ]
 
 
-def test_local_docker_image_exists_checks_without_docker_io_prefix():
+def test_list_local_docker_images_uses_single_docker_ls_call():
     def fake_run(cmd, **kwargs):
-        image_name = cmd[-1]
-        return type("Result", (), {"returncode": 0 if not image_name.startswith("docker.io/") else 1})()
+        return type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": "swebench/sweb.eval.x86_64.test:latest\n<none>:<none>\n"},
+        )()
 
     with patch("minisweagent.run.benchmarks.swebench.subprocess.run", side_effect=fake_run) as mock_run:
-        assert local_docker_image_exists("docker.io/swebench/sweb.eval.x86_64.test:latest")
+        assert list_local_docker_images(executable="podman") == {"swebench/sweb.eval.x86_64.test:latest"}
 
-    assert [call.args[0][-1] for call in mock_run.call_args_list] == [
-        "docker.io/swebench/sweb.eval.x86_64.test:latest",
-        "swebench/sweb.eval.x86_64.test:latest",
-    ]
+    assert mock_run.call_count == 1
+    assert mock_run.call_args.args[0] == ["podman", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]
+
+
+def test_local_docker_image_exists_checks_without_docker_io_prefix():
+    local_images = {"swebench/sweb.eval.x86_64.test:latest"}
+
+    assert local_docker_image_exists("docker.io/swebench/sweb.eval.x86_64.test:latest", local_images=local_images)
 
 
 def test_filter_instances_with_local_images_skips_missing_images():
@@ -142,10 +150,7 @@ def test_filter_instances_with_local_images_skips_missing_images():
         {"instance_id": "repo__skipped", "image_name": "docker.io/swebench/skipped:latest"},
     ]
 
-    with patch(
-        "minisweagent.run.benchmarks.swebench.local_docker_image_exists",
-        side_effect=lambda image_name, *, executable: image_name.endswith("kept:latest"),
-    ):
+    with patch("minisweagent.run.benchmarks.swebench.list_local_docker_images", return_value={"swebench/kept:latest"}):
         assert filter_instances_with_local_images(instances, docker_executable="podman") == [instances[0]]
 
 

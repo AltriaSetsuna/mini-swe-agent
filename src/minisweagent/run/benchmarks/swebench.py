@@ -98,21 +98,26 @@ def get_docker_image_name_candidates(image_name: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
-def local_docker_image_exists(image_name: str, *, executable: str = "docker") -> bool:
-    """Check whether a Docker image exists locally without pulling it."""
-    for candidate in get_docker_image_name_candidates(image_name):
-        try:
-            result = subprocess.run(
-                [executable, "image", "inspect", candidate],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
-        if result.returncode == 0:
-            return True
-    return False
+def list_local_docker_images(*, executable: str = "docker") -> set[str]:
+    """List local Docker images once, without pulling anything."""
+    try:
+        result = subprocess.run(
+            [executable, "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode != 0:
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip() and "<none>" not in line}
+
+
+def local_docker_image_exists(image_name: str, *, local_images: set[str]) -> bool:
+    """Check whether a Docker image exists in a preloaded local image set."""
+    return any(candidate in local_images for candidate in get_docker_image_name_candidates(image_name))
 
 
 def filter_instances_with_local_images(
@@ -122,11 +127,15 @@ def filter_instances_with_local_images(
     image_exists_cache: dict[str, bool] = {}
     filtered_instances = []
     skipped_instances = []
+    total = len(instances)
+    logger.info(f"Checking local SWE-bench Docker images for {total} instances...")
+    local_images = list_local_docker_images(executable=docker_executable)
+    logger.info(f"Found {len(local_images)} local Docker image tags.")
 
-    for instance in instances:
+    for index, instance in enumerate(instances, start=1):
         image_name = get_swebench_docker_image_name(instance)
         if image_name not in image_exists_cache:
-            image_exists_cache[image_name] = local_docker_image_exists(image_name, executable=docker_executable)
+            image_exists_cache[image_name] = local_docker_image_exists(image_name, local_images=local_images)
         if image_exists_cache[image_name]:
             filtered_instances.append(instance)
         else:
@@ -137,8 +146,6 @@ def filter_instances_with_local_images(
             f"Skipping {len(skipped_instances)} instances without local SWE-bench Docker images "
             f"({len(instances)} -> {len(filtered_instances)})"
         )
-        for instance_id, image_name in skipped_instances:
-            logger.debug(f"Skipping instance {instance_id}: local image not found for {image_name}")
 
     return filtered_instances
 
@@ -359,16 +366,20 @@ def main(
 
     logger.info(f"Building agent config from specs: {config_spec}")
     configs = [get_config_from_spec(spec) for spec in config_spec]
+    logger.info("Loaded agent config specs.")
     configs.append({
         "environment": {"environment_class": environment_class or UNSET},
         "model": {"model_name": model or UNSET, "model_class": model_class or UNSET},
     })
     config = recursive_merge(*configs)
+    logger.info("Merged agent config.")
     if port is not None:
         model_kwargs = config.setdefault("model", {}).setdefault("model_kwargs", {})
         model_kwargs["api_base"] = replace_api_base_port(model_kwargs.get("api_base", "http://localhost/v1"), port)
+        logger.info(f"Using model API base: {model_kwargs['api_base']}")
 
     docker_executable = config.get("environment", {}).get("executable", os.getenv("MSWEA_DOCKER_EXECUTABLE", "docker"))
+    logger.info(f"Using Docker executable: {docker_executable}")
     instances = filter_instances_with_local_images(instances, docker_executable=docker_executable)
     logger.info(f"Running on {len(instances)} instances...")
 
